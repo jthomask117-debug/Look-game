@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Don't Look Away</title>
+<style>
+  html,body{margin:0;height:100%;background:#0d0f14;color:#eef;font-family:system-ui,-apple-system,Segoe UI,sans-serif;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none}
+  #c{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+  #cam{position:fixed;width:120px;height:90px;right:12px;bottom:max(12px,env(safe-area-inset-bottom));transform:scaleX(-1);border-radius:10px;opacity:0;pointer-events:none;object-fit:cover;z-index:5}
+  #cam.show{opacity:.9}
+  .panel{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:24px;padding-top:max(24px,env(safe-area-inset-top));text-align:center;background:rgba(13,15,20,.94);z-index:4;overflow:auto}
+  .panel.bottom{top:auto;justify-content:flex-end;background:linear-gradient(transparent,rgba(13,15,20,.95) 30%);padding-bottom:max(28px,env(safe-area-inset-bottom));padding-top:60px}
+  .hidden{display:none!important}
+  h1{margin:0;font-size:30px}
+  h2{margin:0;font-size:24px}
+  p{margin:0;max-width:430px;line-height:1.45;color:#b8bfd0}
+  button{font:inherit;font-size:17px;padding:13px 22px;border-radius:12px;border:0;background:#4f7cff;color:#fff;min-width:230px}
+  button.alt{background:#2a3040}
+  details{max-width:300px;width:100%;text-align:left;color:#b8bfd0;font-size:14px}
+  summary{cursor:pointer;padding:6px 0}
+  label{display:flex;flex-direction:column;gap:4px;margin:10px 0}
+  label.inline{flex-direction:row;align-items:center;gap:8px}
+  input[type=range]{width:100%}
+  #status{color:#ffcf5a;min-height:1.2em}
+  #hud{position:fixed;top:max(10px,env(safe-area-inset-top));left:0;right:0;text-align:center;font-weight:600;font-size:18px;pointer-events:none;text-shadow:0 1px 4px #000;z-index:3}
+  #msg{position:fixed;left:0;right:0;bottom:max(26px,env(safe-area-inset-bottom));text-align:center;font-size:16px;pointer-events:none;text-shadow:0 1px 4px #000;padding:0 20px;z-index:3}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+<div id="hud"></div>
+<div id="msg"></div>
+
+<div id="pMenu" class="panel">
+  <h1>Don't Look Away</h1>
+  <p>A circle appears. Lock your eyes on it. Then it vanishes, a picture full of distractions pops up, and you have to keep looking at the spot where the circle was. Glance away and you lose.</p>
+  <button id="bStart">Play (uses front camera)</button>
+  <button id="bTest" class="alt">Test mode (finger = eyes)</button>
+  <details>
+    <summary>Your own pictures &amp; settings</summary>
+    <label>Use your own images (optional)
+      <input id="fImgs" type="file" accept="image/*" multiple>
+    </label>
+    <label>Hit-zone size: <span id="vTol"></span>
+      <input id="sTol" type="range" min="0" max="40" step="1">
+    </label>
+    <label>Glance forgiveness: <span id="vGrace"></span>
+      <input id="sGrace" type="range" min="100" max="900" step="50">
+    </label>
+    <label class="inline"><input id="cGaze" type="checkbox"> Show where it thinks I'm looking</label>
+  </details>
+  <p id="status"></p>
+</div>
+
+<div id="pCalIntro" class="panel hidden">
+  <h2>Calibration</h2>
+  <p>Hold your phone at normal reading distance and keep your head still. A dot will move to 9 spots. <b>Follow it with your eyes only.</b> It takes about 20 seconds.</p>
+  <p id="faceState">Looking for your face…</p>
+  <button id="bCalGo">Begin</button>
+</div>
+
+<div id="pCalDone" class="panel hidden">
+  <h2>Calibrated</h2>
+  <p id="calInfo"></p>
+  <button id="bPlay">Start game</button>
+  <button id="bFree" class="alt">Check tracking</button>
+  <button id="bRecal" class="alt">Redo calibration</button>
+</div>
+
+<div id="pResult" class="panel bottom hidden">
+  <h2 id="rTitle"></h2>
+  <p id="rText"></p>
+  <button id="bAgain">Play again</button>
+  <button id="bRecal2" class="alt">Recalibrate</button>
+  <button id="bMenu" class="alt">Menu</button>
+</div>
+
+<script type="module">
+const CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+
+const $ = id => document.getElementById(id);
+const cv = $('c'), ctx = cv.getContext('2d'), video = $('cam');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+const minD = () => Math.min(W, H);
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+
+// ---------- settings ----------
+const S = { tolPct: 0, grace: 300, showGaze: false };
+try { Object.assign(S, JSON.parse(localStorage.getItem('dla-settings') || '{}')); } catch (e) {}
+function saveS() { try { localStorage.setItem('dla-settings', JSON.stringify(S)); } catch (e) {} }
+function syncSettingsUI() {
+  $('sTol').value = S.tolPct; $('sGrace').value = S.grace; $('cGaze').checked = S.showGaze;
+  $('vTol').textContent = S.tolPct ? S.tolPct + '% of screen' : 'auto (from calibration)';
+  $('vGrace').textContent = S.grace + ' ms';
+}
+$('sTol').oninput = e => { S.tolPct = +e.target.value; saveS(); syncSettingsUI(); };
+$('sGrace').oninput = e => { S.grace = +e.target.value; saveS(); syncSettingsUI(); };
+$('cGaze').onchange = e => { S.showGaze = e.target.checked; saveS(); };
+syncSettingsUI();
+let best = 0; try { best = +(localStorage.getItem('dla-best') || 0); } catch (e) {}
+
+let images = [];
+$('fImgs').onchange = e => {
+  images = [];
+  for (const f of e.target.files) {
+    const img = new Image(); img.src = URL.createObjectURL(f); images.push(img);
+  }
+  status(images.length ? images.length + ' image(s) loaded.' : '');
+};
+
+// ---------- UI helpers ----------
+const panels = ['pMenu', 'pCalIntro', 'pCalDone', 'pResult'];
+function show(id) { panels.forEach(p => $(p).classList.toggle('hidden', p !== id)); }
+function status(t) { $('status').textContent = t; }
+function msg(t) { $('msg').textContent = t || ''; }
+function hud(t) { $('hud').textContent = t || ''; }
+
+// ---------- tracking state ----------
+let landmarker = null, testMode = false;
+let lastVT = -1, feat = null, faceSeen = 0, blink = false, openEMA = null;
+let model = null, rawG = null, gaze = null, offset = { x: 0, y: 0 };
+let pointer = { x: W / 2, y: H / 2 };
+let autoTol = 0.2;            // fraction of min screen dimension
+const tolPx = () => (S.tolPct ? S.tolPct / 100 : autoTol) * minD();
+
+addEventListener('pointerdown', e => { pointer = { x: e.clientX, y: e.clientY }; });
+addEventListener('pointermove', e => { pointer = { x: e.clientX, y: e.clientY }; });
+
+// Eye features from MediaPipe's 478 face landmarks (468-477 are the irises).
+function eyeFeat(lm, a, b, top, bot, iris) {
+  const A = lm[a], B = lm[b], I = lm[iris], T = lm[top], D = lm[bot];
+  const dx = B.x - A.x, dy = B.y - A.y, w2 = dx * dx + dy * dy;
+  const h = ((I.x - A.x) * dx + (I.y - A.y) * dy) / w2;      // along eye axis
+  const v = ((I.x - A.x) * -dy + (I.y - A.y) * dx) / w2;     // across eye axis
+  const open = Math.hypot(D.x - T.x, D.y - T.y) / Math.sqrt(w2);
+  return [h, v, open];
+}
+function extract(lm) {
+  const L = eyeFeat(lm, 33, 133, 159, 145, 468);
+  const R = eyeFeat(lm, 362, 263, 386, 374, 473);
+  const le = lm[33], re = lm[263], nose = lm[1];
+  const cx = (le.x + re.x) / 2, cy = (le.y + re.y) / 2, iod = Math.hypot(re.x - le.x, re.y - le.y);
+  return [L[0], L[1], R[0], R[1], (L[2] + R[2]) / 2,
+          (nose.x - cx) / iod, (nose.y - cy) / iod, cx, cy, iod, Math.atan2(re.y - le.y, re.x - le.x)];
+}
+
+// Ridge regression: features -> normalized screen x,y
+function solve(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+    [M[c], M[p]] = [M[p], M[c]];
+    const d = M[c][c] || 1e-9;
+    for (let r = 0; r < n; r++) if (r !== c) {
+      const f = M[r][c] / d; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k];
+    }
+  }
+  return M.map((r, i) => r[n] / (r[i] || 1e-9));
+}
+function train(X, Y, lambda = 1) {
+  const d = X[0].length, n = X.length;
+  const mu = Array(d).fill(0), sd = Array(d).fill(0);
+  X.forEach(x => x.forEach((v, i) => mu[i] += v / n));
+  X.forEach(x => x.forEach((v, i) => sd[i] += (v - mu[i]) ** 2 / n));
+  for (let i = 0; i < d; i++) sd[i] = Math.sqrt(sd[i]) || 1;
+  const D = d + 1, A = Array.from({ length: D }, () => Array(D).fill(0)), bx = Array(D).fill(0), by = Array(D).fill(0);
+  X.forEach((x, k) => {
+    const z = [1, ...x.map((v, i) => (v - mu[i]) / sd[i])];
+    for (let i = 0; i < D; i++) {
+      bx[i] += z[i] * Y[k][0]; by[i] += z[i] * Y[k][1];
+      for (let j = 0; j < D; j++) A[i][j] += z[i] * z[j];
+    }
+  });
+  for (let i = 1; i < D; i++) A[i][i] += lambda;
+  return { mu, sd, wx: solve(A, bx), wy: solve(A, by) };
+}
+function predict(f) {
+  const z = [1, ...f.map((v, i) => (v - model.mu[i]) / model.sd[i])];
+  let x = 0, y = 0; z.forEach((v, i) => { x += v * model.wx[i]; y += v * model.wy[i]; });
+  return { x: Math.max(-0.3, Math.min(1.3, x)), y: Math.max(-0.3, Math.min(1.3, y)) };
+}
+
+// ---------- camera ----------
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    throw new Error('The camera only works when this page is opened from an https:// link.');
+  }
+  status('Starting camera…');
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+  video.srcObject = stream; await video.play();
+  status('Loading face tracker…');
+  const vision = await import(CDN + '/vision_bundle.mjs');
+  const fs = await vision.FilesetResolver.forVisionTasks(CDN + '/wasm');
+  const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: 'VIDEO', numFaces: 1 });
+  try { landmarker = await vision.FaceLandmarker.createFromOptions(fs, opts('GPU')); }
+  catch (e) { landmarker = await vision.FaceLandmarker.createFromOptions(fs, opts('CPU')); }
+  status('');
+}
+
+// ---------- game state ----------
+let mode = 'menu', t0 = 0;
+function setMode(m) { mode = m; t0 = performance.now(); }
+
+const CAL_PTS = [[.12,.12],[.5,.12],[.88,.12],[.88,.5],[.5,.5],[.12,.5],[.12,.88],[.5,.88],[.88,.88]];
+const CAL_MS = 1800, CAL_SKIP = 750, VAL_MS = 1600, VAL_SKIP = 700;
+let calIdx = 0, calX = [], calY = [], valPts = [], valPreds = [];
+
+let round = 1, target = { x: .5, y: .5 }, lockSamples = [], lockTries = 0;
+let watchDur = 3000, lures = [], scene = null, outMs = 0, trail = [], loseReason = '', loseAt = null;
+
+function beginCalibration() {
+  calIdx = 0; calX = []; calY = []; model = null; offset = { x: 0, y: 0 };
+  show(null); video.classList.remove('show'); setMode('calib');
+}
+function beginValidation() {
+  valPts = [[.3,.3],[.7,.3],[.7,.7],[.3,.7]].sort(() => Math.random() - .5)
+    .map(p => [p[0] + rand(-.08, .08), p[1] + rand(-.08, .08)]);
+  valPreds = valPts.map(() => []); calIdx = 0; setMode('validate');
+}
+function finishCalibration() {
+  let all = 0, jit = 0, n = 0;
+  valPts.forEach((p, i) => {
+    const ps = valPreds[i]; if (!ps.length) return;
+    const m = ps.reduce((a, q) => ({ x: a.x + q.x / ps.length, y: a.y + q.y / ps.length }), { x: 0, y: 0 });
+    ps.forEach(q => {
+      all += Math.hypot((q.x - p[0]) * W, (q.y - p[1]) * H);
+      jit += Math.hypot((q.x - m.x) * W, (q.y - m.y) * H); n++;
+    });
+  });
+  all /= Math.max(1, n); jit /= Math.max(1, n);
+  model = train(calX, calY);   // retrain with validation samples included
+  const md = minD();
+  autoTol = Math.max(0.10, Math.min(0.38, (jit * 2.5 + 0.03 * md) / md));
+  $('calInfo').innerHTML =
+    `Raw accuracy: about <b>${Math.round(all)} px</b> off, wobbling about <b>${Math.round(jit)} px</b>.<br>` +
+    `The game re-centers on the circle each round, so the wobble matters most.<br>` +
+    `Hit zone radius: <b>${Math.round(tolPx())} px</b>${S.tolPct ? ' (manual)' : ' (auto)'}.`;
+  setMode('calDone'); show('pCalDone');
+}
+
+function newRound() {
+  target = { x: rand(.2, .8), y: rand(.22, .78) };
+  lockSamples = []; lockTries = 0; offset = testMode ? { x: 0, y: 0 } : offset;
+  show(null); hud(`Round ${round}`); setMode('lock');
+}
+function startWatch() {
+  watchDur = Math.min(10000, 3000 + 700 * (round - 1));
+  scene = makeScene(); lures = makeLures(Math.min(8, round + 1)); outMs = 0; trail = [];
+  setMode('watch');
+}
+function lose(reason) {
+  loseReason = reason; loseAt = gaze ? { ...gaze } : null;
+  const score = round - 1;
+  if (score > best) { best = score; try { localStorage.setItem('dla-best', best); } catch (e) {} }
+  $('rTitle').textContent = reason === 'face' ? 'Lost sight of you!' : 'You looked away!';
+  $('rText').textContent = `Rounds survived: ${score}  ·  Best: ${best}` +
+    (reason === 'face' ? '  ·  (couldn’t see your face/eyes)' : '  ·  Yellow line = where your eyes went.');
+  hud(''); msg(''); setMode('result'); show('pResult');
+}
+
+// ---------- scene + distractions ----------
+function makeScene() {
+  const c = document.createElement('canvas'); c.width = W * DPR; c.height = H * DPR;
+  const g = c.getContext('2d'); g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const usable = images.filter(i => i.complete && i.naturalWidth);
+  if (usable.length) {
+    const img = pick(usable), s = Math.max(W / img.naturalWidth, H / img.naturalHeight);
+    const w = img.naturalWidth * s, h = img.naturalHeight * s;
+    g.drawImage(img, (W - w) / 2, (H - h) / 2, w, h);
+    return c;
+  }
+  const hue = rand(0, 360), gr = g.createLinearGradient(0, 0, W, H);
+  gr.addColorStop(0, `hsl(${hue},55%,22%)`); gr.addColorStop(1, `hsl(${(hue + 120) % 360},55%,30%)`);
+  g.fillStyle = gr; g.fillRect(0, 0, W, H);
+  for (let i = 0; i < 55; i++) {
+    g.fillStyle = `hsla(${rand(0, 360)},80%,${rand(40, 70)}%,${rand(.25, .7)})`;
+    const x = rand(0, W), y = rand(0, H), s = rand(10, minD() * .18);
+    g.beginPath();
+    const k = Math.random();
+    if (k < .4) g.arc(x, y, s / 2, 0, 7);
+    else if (k < .7) g.rect(x - s / 2, y - s / 2, s, s * rand(.4, 1.2));
+    else { g.moveTo(x, y - s / 2); g.lineTo(x + s / 2, y + s / 2); g.lineTo(x - s / 2, y + s / 2); }
+    g.fill();
+  }
+  g.font = `${Math.round(minD() * .07)}px serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  for (let i = 0; i < 12; i++) g.fillText(pick(['🌻','🍎','🐸','⭐','🍩','🎈','🐟','🌵','🍄','🚀']), rand(0, W), rand(0, H));
+  return c;
+}
+function farPoint(minFrac) {
+  const tx = target.x * W, ty = target.y * H;
+  for (let i = 0; i < 40; i++) {
+    const x = rand(.1, .9) * W, y = rand(.1, .9) * H;
+    if (Math.hypot(x - tx, y - ty) > minFrac * minD()) return { x, y };
+  }
+  return { x: tx < W / 2 ? W * .85 : W * .15, y: ty < H / 2 ? H * .85 : H * .15 };
+}
+function makeLures(n) {
+  const pool = ['flash', 'word'];
+  if (round >= 2) pool.push('mover');
+  if (round >= 3) pool.push('decoy', 'decoy');
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const type = pick(pool), p = farPoint(.38);
+    const L = { type, t: rand(350, watchDur - 600), ...p,
+      life: { flash: 550, word: 900, mover: 1600, decoy: 1300 }[type],
+      text: pick(['LOOK!', 'HERE!', '👀', '!!!', 'BOO', '?!', '→', '😱']) };
+    if (type === 'mover') {
+      const fromLeft = Math.random() < .5;
+      L.x0 = fromLeft ? -40 : W + 40; L.x1 = fromLeft ? W + 40 : -40;
+      L.y = Math.abs(p.y - target.y * H) < tolPx() * 2 ? (target.y < .5 ? H * .85 : H * .15) : p.y;
+      L.emoji = pick(['🐝', '🦋', '⚡', '🛸', '🐦']);
+    }
+    out.push(L);
+  }
+  return out;
+}
+function drawLures(el) {
+  for (const L of lures) {
+    const a = el - L.t; if (a < 0 || a > L.life) continue;
+    const k = a / L.life;
+    ctx.save();
+    if (L.type === 'flash') {
+      ctx.globalAlpha = 1 - k; ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(L.x, L.y, 10 + k * minD() * .25, 0, 7); ctx.fill();
+    } else if (L.type === 'word') {
+      const s = Math.min(1, k * 6) * (1 + .1 * Math.sin(a / 40));
+      ctx.globalAlpha = k > .8 ? (1 - k) * 5 : 1;
+      ctx.font = `bold ${Math.round(minD() * .12 * s)}px system-ui`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.lineWidth = 6; ctx.strokeStyle = '#000'; ctx.strokeText(L.text, L.x, L.y);
+      ctx.fillStyle = '#ffeb3b'; ctx.fillText(L.text, L.x, L.y);
+    } else if (L.type === 'mover') {
+      const x = L.x0 + (L.x1 - L.x0) * k, y = L.y + Math.sin(a / 120) * 25;
+      ctx.font = `${Math.round(minD() * .1)}px serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(L.emoji, x, y);
+    } else if (L.type === 'decoy') {
+      ctx.globalAlpha = k < .15 ? k / .15 : k > .85 ? (1 - k) / .15 : 1;
+      drawTargetDot(L.x, L.y, a);
+    }
+    ctx.restore();
+  }
+}
+function drawTargetDot(x, y, t) {
+  const r = Math.max(14, minD() * .045);
+  ctx.fillStyle = '#ff4d6d'; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,77,109,.6)'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, r + 6 + 4 * Math.sin(t / 150), 0, 7); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, r * .25, 0, 7); ctx.fill();
+}
+
+// ---------- main loop ----------
+function loop(now) {
+  let newFrame = false;
+  if (landmarker && !testMode && video.readyState >= 2 && video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const r = landmarker.detectForVideo(video, now);
+    if (r.faceLandmarks && r.faceLandmarks.length && r.faceLandmarks[0].length >= 478) {
+      feat = extract(r.faceLandmarks[0]); faceSeen = now; newFrame = true;
+      const o = feat[4];
+      if (openEMA == null) openEMA = o;
+      blink = o < openEMA * 0.62;
+      if (!blink) openEMA = openEMA * 0.97 + o * 0.03;
+    }
+  }
+  if (testMode) { rawG = { x: pointer.x / W, y: pointer.y / H }; faceSeen = now; blink = false; newFrame = true; }
+  else if (model && newFrame && !blink) rawG = predict(feat);
+
+  if (rawG && newFrame && !blink) {
+    const tg = { x: rawG.x + offset.x, y: rawG.y + offset.y }, a = testMode ? 1 : 0.4;
+    if (!gaze) gaze = { ...tg }; else { gaze.x += (tg.x - gaze.x) * a; gaze.y += (tg.y - gaze.y) * a; }
+  }
+  update(now, newFrame);
+  draw(now);
+  requestAnimationFrame(loop);
+}
+let lastNow = performance.now();
+function update(now, newFrame) {
+  const dt = Math.min(100, now - lastNow); lastNow = now;
+  const el = now - t0;
+  const fresh = newFrame && !blink && feat && !testMode;
+
+  if (mode === 'calIntro') {
+    $('faceState').textContent = now - faceSeen < 500 ? 'Face found ✓' : 'Looking for your face… (good light helps)';
+  } else if (mode === 'calib') {
+    const p = CAL_PTS[calIdx];
+    if (el > CAL_SKIP && fresh) { calX.push(feat.slice()); calY.push(p); }
+    if (el > CAL_MS) {
+      calIdx++; t0 = now;
+      if (calIdx >= CAL_PTS.length) {
+        if (calX.length < 40) { msg(''); show('pCalIntro'); video.classList.add('show'); setMode('calIntro');
+          $('faceState').textContent = 'Not enough face data. Try brighter light and hold the phone steady.'; return; }
+        model = train(calX, calY); beginValidation();
+      }
+    }
+    msg('Follow the dot with your eyes');
+  } else if (mode === 'validate') {
+    const p = valPts[calIdx];
+    if (el > VAL_SKIP && fresh && rawG) { valPreds[calIdx].push({ ...rawG }); calX.push(feat.slice()); calY.push(p); }
+    if (el > VAL_MS) { calIdx++; t0 = now; if (calIdx >= valPts.length) { msg(''); finishCalibration(); } }
+    else msg('Checking accuracy… keep following the dot');
+  } else if (mode === 'lock') {
+    const LOCK = 1600;
+    if (el > 700 && (fresh || testMode) && rawG) lockSamples.push({ ...rawG });
+    msg('Lock your eyes on the circle');
+    if (el > LOCK) {
+      if (testMode) {
+        const d = Math.hypot((pointer.x / W - target.x) * W, (pointer.y / H - target.y) * H);
+        if (d > tolPx()) { msg('Put your finger on the circle'); t0 = now; return; }
+        gaze = { x: pointer.x / W, y: pointer.y / H }; startWatch(); return;
+      }
+      if (lockSamples.length < 5) { lockSamples = []; t0 = now; msg('Can’t see your eyes. Check the light'); return; }
+      const n = lockSamples.length;
+      const m = lockSamples.reduce((a, q) => ({ x: a.x + q.x / n, y: a.y + q.y / n }), { x: 0, y: 0 });
+      const spread = lockSamples.reduce((a, q) => a + Math.hypot((q.x - m.x) * W, (q.y - m.y) * H), 0) / n;
+      if (spread > tolPx() * 0.7 && lockTries < 2) { lockTries++; lockSamples = []; t0 = now; return; }
+      offset = { x: target.x - m.x, y: target.y - m.y };     // re-center on the circle
+      gaze = { x: target.x, y: target.y };
+      startWatch();
+    }
+  } else if (mode === 'watch') {
+    msg('');
+    if (gaze) trail.push({ x: gaze.x * W, y: gaze.y * H });
+    if (now - faceSeen > 700) return lose('face');
+    if (gaze && !blink) {
+      const d = Math.hypot((gaze.x - target.x) * W, (gaze.y - target.y) * H);
+      outMs = d > tolPx() ? outMs + dt : 0;
+      if (outMs > S.grace) return lose('look');
+    }
+    if (el > watchDur) {
+      round++; hud(`Round ${round - 1} cleared!`); setMode('between');
+    }
+  } else if (mode === 'between') {
+    if (el > 900) newRound();
+  } else if (mode === 'free') {
+    msg('This dot is where it thinks you’re looking. Tap to go back.');
+  }
+}
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  const el = now - t0, md = minD();
+  if ((mode === 'watch' || mode === 'result') && scene) ctx.drawImage(scene, 0, 0, W, H);
+  else { ctx.fillStyle = '#0d0f14'; ctx.fillRect(0, 0, W, H); }
+
+  if (mode === 'calib' || mode === 'validate') {
+    const p = mode === 'calib' ? CAL_PTS[calIdx] : valPts[calIdx];
+    if (p) {
+      const x = p[0] * W, y = p[1] * H, k = Math.max(0, 1 - el / 600);
+      ctx.strokeStyle = '#7aa2ff'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(x, y, 10 + k * 40, 0, 7); ctx.stroke();
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(x, y, 7, 0, 7); ctx.fill();
+    }
+  }
+  if (mode === 'lock') {
+    const x = target.x * W, y = target.y * H;
+    ctx.setLineDash([6, 6]); ctx.strokeStyle = 'rgba(255,255,255,.18)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y, tolPx(), 0, 7); ctx.stroke(); ctx.setLineDash([]);
+    drawTargetDot(x, y, now);
+    const r = Math.max(14, md * .045) + 14;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + Math.min(1, el / 1600) * Math.PI * 2); ctx.stroke();
+  }
+  if (mode === 'watch') {
+    drawLures(el);
+    ctx.fillStyle = 'rgba(255,255,255,.5)'; ctx.fillRect(0, 0, W * Math.min(1, el / watchDur), 4);
+  }
+  if (mode === 'result') {
+    const x = target.x * W, y = target.y * H;
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = '#3ddc84'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]);
+    ctx.beginPath(); ctx.arc(x, y, tolPx(), 0, 7); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#3ddc84'; ctx.beginPath(); ctx.arc(x, y, 6, 0, 7); ctx.fill();
+    if (trail.length > 1) {
+      ctx.strokeStyle = '#ffd54a'; ctx.lineWidth = 3; ctx.beginPath();
+      trail.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+    }
+    if (loseAt && loseReason === 'look') {
+      const lx = loseAt.x * W, ly = loseAt.y * H;
+      ctx.strokeStyle = '#ff4d6d'; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(lx - 12, ly - 12); ctx.lineTo(lx + 12, ly + 12); ctx.moveTo(lx + 12, ly - 12); ctx.lineTo(lx - 12, ly + 12); ctx.stroke();
+    }
+  }
+  if (gaze && (mode === 'free' || (S.showGaze && ['lock', 'watch'].includes(mode)))) {
+    ctx.fillStyle = 'rgba(0,229,255,.85)'; ctx.strokeStyle = '#000'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(gaze.x * W, gaze.y * H, 11, 0, 7); ctx.fill(); ctx.stroke();
+  }
+}
+
+// ---------- buttons ----------
+$('bStart').onclick = async () => {
+  testMode = false;
+  try {
+    if (!landmarker) await startCamera();
+    show('pCalIntro'); video.classList.add('show'); setMode('calIntro');
+  } catch (e) { status(e.message || String(e)); }
+};
+$('bTest').onclick = () => {
+  testMode = true; model = null; autoTol = 0.15; offset = { x: 0, y: 0 };
+  round = 1; newRound();
+};
+$('bCalGo').onclick = beginCalibration;
+$('bRecal').onclick = $('bRecal2').onclick = () => {
+  if (testMode) { show('pMenu'); setMode('menu'); return; }
+  show('pCalIntro'); video.classList.add('show'); setMode('calIntro');
+};
+$('bPlay').onclick = () => { round = 1; newRound(); };
+$('bAgain').onclick = () => { round = 1; newRound(); };
+$('bMenu').onclick = () => { show('pMenu'); hud(''); setMode('menu'); };
+$('bFree').onclick = () => { show(null); offset = { x: 0, y: 0 }; setMode('free'); };
+cv.addEventListener('pointerdown', () => {
+  if (mode === 'free') { msg(''); show('pCalDone'); setMode('calDone'); }
+});
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
